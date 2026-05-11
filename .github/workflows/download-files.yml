@@ -1,0 +1,179 @@
+name: Download Files & Save to Repo
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install aria2
+        run: sudo apt-get install -y aria2
+
+      - name: Parse commit message and download
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message:"
+          echo "$MSG"
+          echo "----------------------------------------"
+
+          # Extract the first URL from the commit message
+          URL=$(echo "$MSG" | grep -oP '(https?://\S+)' | head -n1)
+          if [ -z "$URL" ]; then
+            echo "❌ No URL found in commit message"
+            exit 1
+          fi
+
+          echo "📥 URL: $URL"
+
+          # --- Option defaults ---
+          TOOL="aria2c"          # aria2c | wget | curl
+          FILENAME=""            # custom output filename (optional)
+          CONNECTIONS="8"        # aria2c split/connections per server
+          AUTH_USER=""           # HTTP basic auth user
+          AUTH_PASS=""           # HTTP basic auth password
+          EXTRA_HEADERS=""       # e.g.  "Header: Value"
+          RETRIES="10"
+
+          # --- Parse options from commit message (case-insensitive) ---
+          # tool: wget
+          if echo "$MSG" | grep -qi "tool: *wget";  then TOOL="wget"; fi
+          if echo "$MSG" | grep -qi "tool: *curl";  then TOOL="curl"; fi
+          if echo "$MSG" | grep -qi "tool: *aria2c"; then TOOL="aria2c"; fi
+
+          # filename: my-file.zip
+          CUSTOM_NAME=$(echo "$MSG" | grep -oiP '(?<=filename:\s)\S+')
+          [ -n "$CUSTOM_NAME" ] && FILENAME="$CUSTOM_NAME"
+
+          # connections: 4
+          CUSTOM_CONN=$(echo "$MSG" | grep -oiP '(?<=connections:\s)\d+')
+          [ -n "$CUSTOM_CONN" ] && CONNECTIONS="$CUSTOM_CONN"
+
+          # retries: 5
+          CUSTOM_RET=$(echo "$MSG" | grep -oiP '(?<=retries:\s)\d+')
+          [ -n "$CUSTOM_RET" ] && RETRIES="$CUSTOM_RET"
+
+          mkdir -p downloads
+
+          echo "⚙️  Tool=$TOOL | Connections=$CONNECTIONS | Retries=$RETRIES"
+          [ -n "$FILENAME" ] && echo "📝 Output filename: $FILENAME"
+
+          # ---------------------------------------------------------------
+          # Build and run the download command
+          # ---------------------------------------------------------------
+          case "$TOOL" in
+
+            aria2c)
+              CMD="aria2c \
+                --max-connection-per-server=$CONNECTIONS \
+                --split=$CONNECTIONS \
+                --max-tries=$RETRIES \
+                --retry-wait=3 \
+                --auto-file-renaming=false \
+                --continue=true \
+                --dir=downloads"
+
+              [ -n "$FILENAME" ]   && CMD="$CMD --out='$FILENAME'"
+              [ -n "$AUTH_USER" ]  && CMD="$CMD --http-user='$AUTH_USER'"
+              [ -n "$AUTH_PASS" ]  && CMD="$CMD --http-passwd='$AUTH_PASS'"
+              [ -n "$EXTRA_HEADERS" ] && CMD="$CMD --header='$EXTRA_HEADERS'"
+
+              CMD="$CMD '$URL'"
+              ;;
+
+            wget)
+              CMD="wget \
+                --tries=$RETRIES \
+                --waitretry=3 \
+                --continue \
+                --show-progress \
+                -P downloads"
+
+              [ -n "$FILENAME" ]   && CMD="$CMD -O 'downloads/$FILENAME'"
+              [ -n "$AUTH_USER" ]  && CMD="$CMD --user='$AUTH_USER' --password='$AUTH_PASS'"
+              [ -n "$EXTRA_HEADERS" ] && CMD="$CMD --header='$EXTRA_HEADERS'"
+
+              CMD="$CMD '$URL'"
+              ;;
+
+            curl)
+              OUTPUT="${FILENAME:-$(basename "$URL" | cut -d'?' -f1)}"
+              CMD="curl \
+                --retry $RETRIES \
+                --retry-delay 3 \
+                --location \
+                --continue-at - \
+                --progress-bar \
+                -o 'downloads/$OUTPUT'"
+
+              [ -n "$AUTH_USER" ]  && CMD="$CMD --user '$AUTH_USER:$AUTH_PASS'"
+              [ -n "$EXTRA_HEADERS" ] && CMD="$CMD -H '$EXTRA_HEADERS'"
+
+              CMD="$CMD '$URL'"
+              ;;
+          esac
+
+          echo "🚀 Running: $CMD"
+          eval "$CMD"
+          echo "✅ Download finished"
+
+      - name: Split large files into 90MB chunks
+        run: |
+          echo "🔧 Checking downloaded files for splitting..."
+
+          LIMIT=$((90 * 1024 * 1024))  # 90 MB in bytes
+
+          for FILE in downloads/*; do
+            [ -f "$FILE" ] || continue
+
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            NAME="${BASENAME%.*}"
+
+            # Sanitise name → kebab-case folder name
+            FOLDERNAME=$(echo "$NAME" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9]/-/g' \
+              | sed 's/-\+/-/g' \
+              | sed 's/^-//;s/-$//')
+
+            echo "📄 $BASENAME ($(numfmt --to=iec-i --suffix=B "$SIZE"))"
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️  File exceeds 90 MB — splitting → $FOLDERNAME/"
+
+              mkdir -p "downloads/$FOLDERNAME"
+              mv "$FILE" "downloads/$FOLDERNAME/$BASENAME"
+              cd "downloads/$FOLDERNAME" || exit 1
+
+              zip -s 90m "${FOLDERNAME}.zip" "$BASENAME" -q
+              rm -f "$BASENAME"
+
+              cd ../..
+              echo "✅ Multipart zip created in downloads/$FOLDERNAME/"
+            else
+              echo "✅ File is under 90 MB — kept as-is"
+            fi
+          done
+
+          echo "🎉 All files processed"
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add downloads/
+          git commit -m "Add downloaded files from commit [skip ci]" || echo "Nothing to commit"
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin HEAD:$BRANCH
