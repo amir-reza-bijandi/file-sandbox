@@ -81,6 +81,7 @@ jobs:
                 --retry-wait=3 \
                 --auto-file-renaming=false \
                 --continue=true \
+                --console-log-level=error \
                 --dir=downloads"
 
               [ -n "$FILENAME" ]   && CMD="$CMD --out='$FILENAME'"
